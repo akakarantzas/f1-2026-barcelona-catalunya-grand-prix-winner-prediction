@@ -10,8 +10,7 @@ import numpy as np
 import pandas as pd
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
-from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.metrics import brier_score_loss, log_loss
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OrdinalEncoder
@@ -24,6 +23,11 @@ MODEL_PATH = ROOT / "barcelona_catalunya_model.pkl"
 PREDICTIONS_PATH = ROOT / "barcelona_catalunya_predictions.json"
 METADATA_PATH = ROOT / "barcelona_catalunya_metadata.json"
 GRID_OVERRIDE_PATH = ROOT / "qualifying_grid.json"
+POSTPROCESS_CANDIDATES = [
+    {"model_weight": model_weight, "floor": floor}
+    for model_weight in (0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85)
+    for floor in (0.0005, 0.001, 0.002)
+]
 
 RACES_TO_LOAD = [
     (2022, "Spain"),
@@ -298,7 +302,7 @@ def build_prediction_rows(data: pd.DataFrame, grid_positions: dict[str, int]) ->
     return pd.DataFrame(rows)
 
 
-def apply_probability_postprocess(pred: pd.DataFrame, model_probs: np.ndarray) -> pd.Series:
+def calculate_form_prior(pred: pd.DataFrame) -> pd.Series:
     avg_points_max = pred["AvgPoints5"].clip(lower=0).max()
     team_points_max = pred["TeamAvgPoints5"].clip(lower=0).max()
     form_score = (
@@ -308,12 +312,152 @@ def apply_probability_postprocess(pred: pd.DataFrame, model_probs: np.ndarray) -
         + pred["WinRate10"].clip(lower=0)
         + pred["BarcelonaWinRate"].clip(lower=0)
     )
-    form_score = form_score / form_score.sum()
-    blended_score = (0.75 * model_probs) + (0.25 * form_score.to_numpy()) + 0.001
-    return pd.Series(blended_score / blended_score.sum(), index=pred.index)
+    return form_score / form_score.sum()
 
 
-def run_walk_forward_backtest(data: pd.DataFrame, min_training_races: int = 8) -> dict:
+def blend_probabilities(
+    model_probs: np.ndarray,
+    form_prior: pd.Series,
+    model_weight: float,
+    floor: float,
+) -> pd.Series:
+    blended_score = (
+        (model_weight * model_probs)
+        + ((1 - model_weight) * form_prior.to_numpy())
+        + floor
+    )
+    return pd.Series(blended_score / blended_score.sum(), index=form_prior.index)
+
+
+def apply_probability_postprocess(
+    pred: pd.DataFrame,
+    model_probs: np.ndarray,
+    model_weight: float,
+    floor: float,
+) -> pd.Series:
+    form_prior = calculate_form_prior(pred)
+    return blend_probabilities(model_probs, form_prior, model_weight, floor)
+
+
+def summarize_backtest(results: list[dict], probability_rows: list[dict]) -> dict:
+    if not results:
+        return {
+            "races_tested": 0,
+            "top1_accuracy": None,
+            "top3_accuracy": None,
+            "top5_accuracy": None,
+            "mean_winner_rank": None,
+            "log_loss": None,
+            "brier_score": None,
+        }
+
+    actual = [row["actual"] for row in probability_rows]
+    probability = [row["probability"] for row in probability_rows]
+    return {
+        "races_tested": len(results),
+        "top1_accuracy": round(float(np.mean([row["winner_rank"] == 1 for row in results])), 4),
+        "top3_accuracy": round(float(np.mean([row["winner_rank"] <= 3 for row in results])), 4),
+        "top5_accuracy": round(float(np.mean([row["winner_rank"] <= 5 for row in results])), 4),
+        "mean_winner_rank": round(float(np.mean([row["winner_rank"] for row in results])), 2),
+        "log_loss": round(float(log_loss(actual, probability)), 4),
+        "brier_score": round(float(brier_score_loss(actual, probability)), 4),
+    }
+
+
+def rank_backtest_result(item: dict) -> tuple:
+    summary = item["summary"]
+    return (
+        summary["top1_accuracy"] or 0,
+        -1 * (summary["mean_winner_rank"] or 999),
+        -1 * (summary["log_loss"] or 999),
+        -1 * (summary["brier_score"] or 999),
+    )
+
+
+def tune_walk_forward_postprocess(data: pd.DataFrame, min_training_races: int = 8) -> dict:
+    race_keys = (
+        data[["RaceOrder", "Year", "GrandPrix"]]
+        .drop_duplicates()
+        .sort_values("RaceOrder")
+        .to_dict("records")
+    )
+    candidates = {
+        index: {"config": config, "races": [], "probability_rows": []}
+        for index, config in enumerate(POSTPROCESS_CANDIDATES)
+    }
+
+    for race in race_keys:
+        prior_race_count = sum(item["RaceOrder"] < race["RaceOrder"] for item in race_keys)
+        if prior_race_count < min_training_races:
+            continue
+
+        train = data[data["RaceOrder"] < race["RaceOrder"]]
+        target = data[data["RaceOrder"] == race["RaceOrder"]].copy()
+        if train["Winner"].nunique() < 2 or target.empty:
+            continue
+
+        model = build_model()
+        model.fit(train[FEATURES], train["Winner"])
+        model_probs = model.predict_proba(target[FEATURES])[:, 1]
+        form_prior = calculate_form_prior(target)
+
+        for candidate in candidates.values():
+            config = candidate["config"]
+            target["probability"] = blend_probabilities(
+                model_probs,
+                form_prior,
+                config["model_weight"],
+                config["floor"],
+            )
+            ranked = target.sort_values("probability", ascending=False).reset_index(drop=True)
+            winner_index = ranked.index[ranked["Winner"].eq(1)]
+            if len(winner_index) == 0:
+                continue
+
+            winner_rank = int(winner_index[0] + 1)
+            winner = ranked.loc[winner_index[0]]
+            candidate["races"].append(
+                {
+                    "race": f"{race['Year']} {race['GrandPrix']}",
+                    "winner": str(winner["Abbreviation"]),
+                    "winner_rank": winner_rank,
+                    "winner_probability": round(float(winner["probability"]), 4),
+                }
+            )
+            candidate["probability_rows"].extend(
+                {
+                    "actual": int(row["Winner"]),
+                    "probability": float(row["probability"]),
+                }
+                for _, row in ranked.iterrows()
+            )
+
+    evaluated = []
+    for candidate in candidates.values():
+        evaluated.append(
+            {
+                "config": candidate["config"],
+                "races": candidate["races"],
+                "summary": summarize_backtest(candidate["races"], candidate["probability_rows"]),
+            }
+        )
+
+    best = max(evaluated, key=rank_backtest_result)
+    return {
+        "selected_config": best["config"],
+        "races": best["races"],
+        "summary": best["summary"],
+        "candidates_tested": len(evaluated),
+        "selection_metric": "top1_accuracy, then mean_winner_rank, log_loss, brier_score",
+    }
+
+
+def run_walk_forward_backtest(
+    data: pd.DataFrame,
+    model_weight: float,
+    floor: float,
+    min_training_races: int = 8,
+) -> dict:
     race_keys = (
         data[["RaceOrder", "Year", "GrandPrix"]]
         .drop_duplicates()
@@ -336,7 +480,12 @@ def run_walk_forward_backtest(data: pd.DataFrame, min_training_races: int = 8) -
         model = build_model()
         model.fit(train[FEATURES], train["Winner"])
         model_probs = model.predict_proba(target[FEATURES])[:, 1]
-        target["probability"] = apply_probability_postprocess(target, model_probs)
+        target["probability"] = apply_probability_postprocess(
+            target,
+            model_probs,
+            model_weight,
+            floor,
+        )
         ranked = target.sort_values("probability", ascending=False).reset_index(drop=True)
         winner_index = ranked.index[ranked["Winner"].eq(1)]
         if len(winner_index) == 0:
@@ -360,50 +509,29 @@ def run_walk_forward_backtest(data: pd.DataFrame, min_training_races: int = 8) -
             for _, row in ranked.iterrows()
         )
 
-    if not results:
-        return {
-            "races": [],
-            "summary": {
-                "races_tested": 0,
-                "top1_accuracy": None,
-                "top3_accuracy": None,
-                "top5_accuracy": None,
-                "mean_winner_rank": None,
-                "log_loss": None,
-                "brier_score": None,
-            },
-        }
-
-    actual = [row["actual"] for row in probability_rows]
-    probability = [row["probability"] for row in probability_rows]
     return {
         "races": results,
-        "summary": {
-            "races_tested": len(results),
-            "top1_accuracy": round(float(np.mean([row["winner_rank"] == 1 for row in results])), 4),
-            "top3_accuracy": round(float(np.mean([row["winner_rank"] <= 3 for row in results])), 4),
-            "top5_accuracy": round(float(np.mean([row["winner_rank"] <= 5 for row in results])), 4),
-            "mean_winner_rank": round(float(np.mean([row["winner_rank"] for row in results])), 2),
-            "log_loss": round(float(log_loss(actual, probability)), 4),
-            "brier_score": round(float(brier_score_loss(actual, probability)), 4),
-        },
+        "summary": summarize_backtest(results, probability_rows),
     }
 
 
 def main() -> None:
     data = engineer_features(load_results())
     grid_positions, grid_metadata = load_grid_positions()
+    tuned_postprocess = tune_walk_forward_postprocess(data)
+    model_weight = tuned_postprocess["selected_config"]["model_weight"]
+    floor = tuned_postprocess["selected_config"]["floor"]
     model = build_model()
     x = data[FEATURES]
-    y = data["Winner"]
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    cv_probs = cross_val_predict(model, x, y, cv=cv, method="predict_proba")[:, 1]
 
-    model.fit(x, y)
+    model.fit(x, data["Winner"])
     pred = build_prediction_rows(data, grid_positions)
     model_probs = model.predict_proba(pred[FEATURES])[:, 1]
-    pred["probability"] = apply_probability_postprocess(pred, model_probs)
-    backtest = run_walk_forward_backtest(data)
+    pred["probability"] = apply_probability_postprocess(pred, model_probs, model_weight, floor)
+    backtest = {
+        "races": tuned_postprocess["races"],
+        "summary": tuned_postprocess["summary"],
+    }
 
     predictions = [
         {
@@ -417,19 +545,23 @@ def main() -> None:
     metadata = {
         "race": "Barcelona-Catalunya GP",
         "circuit": "Circuit de Barcelona-Catalunya",
-        "model_version": "barcelona-catalunya-hgb-calibrated-1.0",
+        "model_version": "barcelona-catalunya-hgb-calibrated-1.1",
         "training_samples": int(len(data)),
         "training_races_loaded": int(data[["Year", "GrandPrix"]].drop_duplicates().shape[0]),
         "features": FEATURES,
         "validation": {
-            "roc_auc": round(float(roc_auc_score(y, cv_probs)), 4),
-            "log_loss": round(float(log_loss(y, cv_probs)), 4),
-            "brier_score": round(float(brier_score_loss(y, cv_probs)), 4),
+            "method": "walk_forward_backtest",
+            **backtest["summary"],
         },
         "prediction_postprocess": {
-            "model_weight": 0.75,
-            "form_prior_weight": 0.25,
-            "floor_before_normalization": 0.001,
+            "model_weight": model_weight,
+            "form_prior_weight": round(1 - model_weight, 4),
+            "floor_before_normalization": floor,
+            "selection": {
+                "method": "walk_forward_grid_search",
+                "candidates_tested": tuned_postprocess["candidates_tested"],
+                "selection_metric": tuned_postprocess["selection_metric"],
+            },
         },
         "prediction_input": grid_metadata,
         "backtest": backtest,
