@@ -26,5 +26,4 @@ python train_barcelona_catalunya.py
 
 ## Production Integration
 
-Copy only the exported JSON/model artifacts into `chicane-ai`. Keep notebooks, caches, and training code in this repository.
-
+`chicane-ai` consumes the exported prediction artifacts. Training code, notebooks, and FastF1 cache data stay in this repository.
