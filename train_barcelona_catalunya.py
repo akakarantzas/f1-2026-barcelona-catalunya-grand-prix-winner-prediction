@@ -23,6 +23,7 @@ CACHE_DIR = ROOT / "cache"
 MODEL_PATH = ROOT / "barcelona_catalunya_model.pkl"
 PREDICTIONS_PATH = ROOT / "barcelona_catalunya_predictions.json"
 METADATA_PATH = ROOT / "barcelona_catalunya_metadata.json"
+GRID_OVERRIDE_PATH = ROOT / "qualifying_grid.json"
 
 RACES_TO_LOAD = [
     (2022, "Spain"),
@@ -128,6 +129,36 @@ PROJECTED_GRID = {
     "PER": 21,
     "BOT": 22,
 }
+
+
+def load_grid_positions() -> tuple[dict[str, int], dict]:
+    if not GRID_OVERRIDE_PATH.exists():
+        return PROJECTED_GRID.copy(), {
+            "grid_source": "projected_grid",
+            "grid_override_file": None,
+            "overridden_drivers": [],
+        }
+
+    raw_grid = json.loads(GRID_OVERRIDE_PATH.read_text(encoding="utf-8"))
+    if not isinstance(raw_grid, dict):
+        raise ValueError("qualifying_grid.json must be an object like {\"NOR\": 1, \"PIA\": 2}")
+
+    grid = PROJECTED_GRID.copy()
+    unknown_codes = sorted(set(raw_grid) - set(PROJECTED_GRID))
+    if unknown_codes:
+        raise ValueError(f"qualifying_grid.json contains unknown driver codes: {unknown_codes}")
+
+    for code, position in raw_grid.items():
+        position = int(position)
+        if position < 1:
+            raise ValueError(f"Grid position for {code} must be 1 or greater")
+        grid[code] = position
+
+    return grid, {
+        "grid_source": "qualifying_grid",
+        "grid_override_file": GRID_OVERRIDE_PATH.name,
+        "overridden_drivers": sorted(raw_grid),
+    }
 
 
 def load_results() -> pd.DataFrame:
@@ -240,7 +271,7 @@ def build_model() -> Pipeline:
     )
 
 
-def build_prediction_rows(data: pd.DataFrame) -> pd.DataFrame:
+def build_prediction_rows(data: pd.DataFrame, grid_positions: dict[str, int]) -> pd.DataFrame:
     latest = data.sort_values("RaceOrder").groupby("Abbreviation").tail(1).set_index("Abbreviation")
     rows = []
 
@@ -251,10 +282,10 @@ def build_prediction_rows(data: pd.DataFrame) -> pd.DataFrame:
                 "Abbreviation": code,
                 "driver": driver,
                 "TeamName": team,
-                "GridPosition": PROJECTED_GRID[code],
+                "GridPosition": grid_positions[code],
                 "DriverCode": code,
                 "AvgPoints5": float(history["AvgPoints5"]) if history is not None else 0.0,
-                "AvgGrid5": float(history["AvgGrid5"]) if history is not None else PROJECTED_GRID[code],
+                "AvgGrid5": float(history["AvgGrid5"]) if history is not None else grid_positions[code],
                 "AvgFinish5": float(history["AvgFinish5"]) if history is not None else 14.0,
                 "WinRate10": float(history["WinRate10"]) if history is not None else 0.0,
                 "TeamAvgPoints5": float(history["TeamAvgPoints5"]) if history is not None else 0.0,
@@ -361,6 +392,7 @@ def run_walk_forward_backtest(data: pd.DataFrame, min_training_races: int = 8) -
 
 def main() -> None:
     data = engineer_features(load_results())
+    grid_positions, grid_metadata = load_grid_positions()
     model = build_model()
     x = data[FEATURES]
     y = data["Winner"]
@@ -368,7 +400,7 @@ def main() -> None:
     cv_probs = cross_val_predict(model, x, y, cv=cv, method="predict_proba")[:, 1]
 
     model.fit(x, y)
-    pred = build_prediction_rows(data)
+    pred = build_prediction_rows(data, grid_positions)
     model_probs = model.predict_proba(pred[FEATURES])[:, 1]
     pred["probability"] = apply_probability_postprocess(pred, model_probs)
     backtest = run_walk_forward_backtest(data)
@@ -399,6 +431,7 @@ def main() -> None:
             "form_prior_weight": 0.25,
             "floor_before_normalization": 0.001,
         },
+        "prediction_input": grid_metadata,
         "backtest": backtest,
     }
 

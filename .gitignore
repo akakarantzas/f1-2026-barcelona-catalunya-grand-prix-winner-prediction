@@ -3,4 +3,4 @@ __pycache__/
 .venv/
 cache/
 .ipynb_checkpoints/
-
+qualifying_grid.json

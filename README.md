@@ -18,6 +18,10 @@ pip install -r requirements.txt
 python train_barcelona_catalunya.py
 ```
 
+## Qualifying Grid
+
+Before qualifying, the script uses the projected grid in `train_barcelona_catalunya.py`. After qualifying, copy `qualifying_grid.example.json` to `qualifying_grid.json`, update the positions, and rerun training/export.
+
 ## Outputs
 
 - `barcelona_catalunya_predictions.json`
