@@ -28,14 +28,15 @@ RACES_TO_LOAD = [
     (2022, "Spain"),
     (2023, "Spain"),
     (2024, "Spain"),
-    (2025, "Spain"),
+    (2025, "Australia"),
+    (2025, "China"),
+    (2025, "Japan"),
     (2025, "Bahrain"),
     (2025, "Saudi Arabia"),
-    (2025, "Australia"),
-    (2025, "Japan"),
-    (2025, "China"),
+    (2025, "Miami"),
     (2025, "Emilia Romagna"),
     (2025, "Monaco"),
+    (2025, "Spain"),
     (2025, "Canada"),
     (2025, "Austria"),
     (2025, "British"),
@@ -133,7 +134,7 @@ def load_results() -> pd.DataFrame:
     fastf1.Cache.enable_cache(str(CACHE_DIR))
     rows = []
 
-    for year, gp in RACES_TO_LOAD:
+    for race_order, (year, gp) in enumerate(RACES_TO_LOAD):
         try:
             session = fastf1.get_session(year, gp, "R")
             session.load(telemetry=False, weather=False, messages=False)
@@ -144,6 +145,7 @@ def load_results() -> pd.DataFrame:
                 raise RuntimeError("FastF1 returned no classified results")
             result["Year"] = year
             result["GrandPrix"] = gp
+            result["RaceOrder"] = race_order
             result["IsStreetCircuit"] = int(gp in STREET_CIRCUITS)
             result["Winner"] = (pd.to_numeric(result["Position"], errors="coerce") == 1).astype(int)
             rows.append(result)
@@ -162,24 +164,45 @@ def load_results() -> pd.DataFrame:
 
 
 def engineer_features(data: pd.DataFrame) -> pd.DataFrame:
-    data = data.sort_values(["Year", "GrandPrix", "Position"])
+    data = data.sort_values(["RaceOrder", "Position"])
     grouped_driver = data.groupby("Abbreviation", group_keys=False)
     grouped_team = data.groupby("TeamName", group_keys=False)
 
-    data["AvgPoints5"] = grouped_driver["Points"].transform(lambda x: x.rolling(5, min_periods=1).mean())
-    data["AvgGrid5"] = grouped_driver["GridPosition"].transform(lambda x: x.rolling(5, min_periods=1).mean())
-    data["AvgFinish5"] = grouped_driver["Position"].transform(lambda x: x.rolling(5, min_periods=1).mean())
-    data["WinRate10"] = grouped_driver["Winner"].transform(lambda x: x.rolling(10, min_periods=1).mean())
-    data["TeamAvgPoints5"] = grouped_team["Points"].transform(lambda x: x.rolling(5, min_periods=1).mean())
-
-    barcelona = data["GrandPrix"].eq("Spain")
-    data["BarcelonaExperience"] = data.groupby("Abbreviation")["GrandPrix"].transform(lambda x: x.eq("Spain").cumsum())
-    data["BarcelonaWinRate"] = (
-        data.assign(BarcelonaWinner=np.where(barcelona, data["Winner"], np.nan))
-        .groupby("Abbreviation")["BarcelonaWinner"]
-        .transform(lambda x: x.expanding(min_periods=1).mean())
-        .fillna(0)
+    data["AvgPoints5"] = grouped_driver["Points"].transform(
+        lambda x: x.shift(1).rolling(5, min_periods=1).mean()
     )
+    data["AvgGrid5"] = grouped_driver["GridPosition"].transform(
+        lambda x: x.shift(1).rolling(5, min_periods=1).mean()
+    )
+    data["AvgFinish5"] = grouped_driver["Position"].transform(
+        lambda x: x.shift(1).rolling(5, min_periods=1).mean()
+    )
+    data["WinRate10"] = grouped_driver["Winner"].transform(
+        lambda x: x.shift(1).rolling(10, min_periods=1).mean()
+    )
+    data["TeamAvgPoints5"] = grouped_team["Points"].transform(
+        lambda x: x.shift(1).rolling(5, min_periods=1).mean()
+    )
+
+    data["BarcelonaExperience"] = data.groupby("Abbreviation")["GrandPrix"].transform(
+        lambda x: x.eq("Spain").shift(fill_value=False).cumsum()
+    )
+    data["BarcelonaWinRate"] = 0.0
+    for _, index in data.groupby("Abbreviation").groups.items():
+        driver_rows = data.loc[index].sort_values("RaceOrder")
+        prior_barcelona_wins = []
+        wins = []
+        for _, row in driver_rows.iterrows():
+            prior_barcelona_wins.append(float(np.mean(wins)) if wins else 0.0)
+            if row["GrandPrix"] == "Spain":
+                wins.append(row["Winner"])
+        data.loc[driver_rows.index, "BarcelonaWinRate"] = prior_barcelona_wins
+
+    data["AvgPoints5"] = data["AvgPoints5"].fillna(0)
+    data["AvgGrid5"] = data["AvgGrid5"].fillna(data["GridPosition"])
+    data["AvgFinish5"] = data["AvgFinish5"].fillna(14)
+    data["WinRate10"] = data["WinRate10"].fillna(0)
+    data["TeamAvgPoints5"] = data["TeamAvgPoints5"].fillna(0)
     return data
 
 
@@ -218,7 +241,7 @@ def build_model() -> Pipeline:
 
 
 def build_prediction_rows(data: pd.DataFrame) -> pd.DataFrame:
-    latest = data.sort_values(["Year", "GrandPrix"]).groupby("Abbreviation").tail(1).set_index("Abbreviation")
+    latest = data.sort_values("RaceOrder").groupby("Abbreviation").tail(1).set_index("Abbreviation")
     rows = []
 
     for code, driver, team in DRIVER_ROSTER_2026:
@@ -244,6 +267,98 @@ def build_prediction_rows(data: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def apply_probability_postprocess(pred: pd.DataFrame, model_probs: np.ndarray) -> pd.Series:
+    avg_points_max = pred["AvgPoints5"].clip(lower=0).max()
+    team_points_max = pred["TeamAvgPoints5"].clip(lower=0).max()
+    form_score = (
+        (1 / pred["GridPosition"].clip(lower=1))
+        + pred["AvgPoints5"].clip(lower=0) / (avg_points_max if avg_points_max else 1)
+        + pred["TeamAvgPoints5"].clip(lower=0) / (team_points_max if team_points_max else 1)
+        + pred["WinRate10"].clip(lower=0)
+        + pred["BarcelonaWinRate"].clip(lower=0)
+    )
+    form_score = form_score / form_score.sum()
+    blended_score = (0.75 * model_probs) + (0.25 * form_score.to_numpy()) + 0.001
+    return pd.Series(blended_score / blended_score.sum(), index=pred.index)
+
+
+def run_walk_forward_backtest(data: pd.DataFrame, min_training_races: int = 8) -> dict:
+    race_keys = (
+        data[["RaceOrder", "Year", "GrandPrix"]]
+        .drop_duplicates()
+        .sort_values("RaceOrder")
+        .to_dict("records")
+    )
+    results = []
+    probability_rows = []
+
+    for race in race_keys:
+        prior_race_count = sum(item["RaceOrder"] < race["RaceOrder"] for item in race_keys)
+        if prior_race_count < min_training_races:
+            continue
+
+        train = data[data["RaceOrder"] < race["RaceOrder"]]
+        target = data[data["RaceOrder"] == race["RaceOrder"]].copy()
+        if train["Winner"].nunique() < 2 or target.empty:
+            continue
+
+        model = build_model()
+        model.fit(train[FEATURES], train["Winner"])
+        model_probs = model.predict_proba(target[FEATURES])[:, 1]
+        target["probability"] = apply_probability_postprocess(target, model_probs)
+        ranked = target.sort_values("probability", ascending=False).reset_index(drop=True)
+        winner_index = ranked.index[ranked["Winner"].eq(1)]
+        if len(winner_index) == 0:
+            continue
+
+        winner_rank = int(winner_index[0] + 1)
+        winner = ranked.loc[winner_index[0]]
+        results.append(
+            {
+                "race": f"{race['Year']} {race['GrandPrix']}",
+                "winner": str(winner["Abbreviation"]),
+                "winner_rank": winner_rank,
+                "winner_probability": round(float(winner["probability"]), 4),
+            }
+        )
+        probability_rows.extend(
+            {
+                "actual": int(row["Winner"]),
+                "probability": float(row["probability"]),
+            }
+            for _, row in ranked.iterrows()
+        )
+
+    if not results:
+        return {
+            "races": [],
+            "summary": {
+                "races_tested": 0,
+                "top1_accuracy": None,
+                "top3_accuracy": None,
+                "top5_accuracy": None,
+                "mean_winner_rank": None,
+                "log_loss": None,
+                "brier_score": None,
+            },
+        }
+
+    actual = [row["actual"] for row in probability_rows]
+    probability = [row["probability"] for row in probability_rows]
+    return {
+        "races": results,
+        "summary": {
+            "races_tested": len(results),
+            "top1_accuracy": round(float(np.mean([row["winner_rank"] == 1 for row in results])), 4),
+            "top3_accuracy": round(float(np.mean([row["winner_rank"] <= 3 for row in results])), 4),
+            "top5_accuracy": round(float(np.mean([row["winner_rank"] <= 5 for row in results])), 4),
+            "mean_winner_rank": round(float(np.mean([row["winner_rank"] for row in results])), 2),
+            "log_loss": round(float(log_loss(actual, probability)), 4),
+            "brier_score": round(float(brier_score_loss(actual, probability)), 4),
+        },
+    }
+
+
 def main() -> None:
     data = engineer_features(load_results())
     model = build_model()
@@ -255,16 +370,8 @@ def main() -> None:
     model.fit(x, y)
     pred = build_prediction_rows(data)
     model_probs = model.predict_proba(pred[FEATURES])[:, 1]
-    form_score = (
-        (1 / pred["GridPosition"].clip(lower=1))
-        + pred["AvgPoints5"].clip(lower=0) / pred["AvgPoints5"].clip(lower=0).max()
-        + pred["TeamAvgPoints5"].clip(lower=0) / pred["TeamAvgPoints5"].clip(lower=0).max()
-        + pred["WinRate10"].clip(lower=0)
-        + pred["BarcelonaWinRate"].clip(lower=0)
-    )
-    form_score = form_score / form_score.sum()
-    blended_score = (0.75 * model_probs) + (0.25 * form_score.to_numpy()) + 0.001
-    pred["probability"] = blended_score / blended_score.sum()
+    pred["probability"] = apply_probability_postprocess(pred, model_probs)
+    backtest = run_walk_forward_backtest(data)
 
     predictions = [
         {
@@ -292,6 +399,7 @@ def main() -> None:
             "form_prior_weight": 0.25,
             "floor_before_normalization": 0.001,
         },
+        "backtest": backtest,
     }
 
     joblib.dump(model, MODEL_PATH)
