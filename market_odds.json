@@ -1,10 +1,34 @@
 {
-  "source": "User-provided Barcelona-Catalunya pre-race market note",
+  "source": "formula1.com betting guide and pre-race sportsbook consensus",
   "as_of": "2026-06-13",
   "odds": {
     "ANT": {
-      "decimal": 2.0,
-      "label": "1/1 (+100)"
+      "decimal": 2.10,
+      "label": "+110"
+    },
+    "RUS": {
+      "decimal": 3.50,
+      "label": "+250"
+    },
+    "VER": {
+      "decimal": 8.00,
+      "label": "+700"
+    },
+    "NOR": {
+      "decimal": 10.00,
+      "label": "+900"
+    },
+    "PIA": {
+      "decimal": 13.00,
+      "label": "+1200"
+    },
+    "HAM": {
+      "decimal": 15.00,
+      "label": "+1400"
+    },
+    "LEC": {
+      "decimal": 15.00,
+      "label": "+1400"
     }
   }
 }
