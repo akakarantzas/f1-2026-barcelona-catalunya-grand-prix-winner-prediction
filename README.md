@@ -34,9 +34,11 @@ Prediction-only priors affect the exported 2026 Barcelona-Catalunya prediction, 
 
 - Version: `barcelona-catalunya-hgb-calibrated-1.3`
 - Training samples: `671`
-- Training races loaded: `33`
+- Historical races loaded: `33`
 
 Walk-forward validation:
+
+Validation starts after the first 8 loaded races are available as training history, so 25 of the 33 loaded races are tested.
 
 | Metric | Value |
 | --- | ---: |
