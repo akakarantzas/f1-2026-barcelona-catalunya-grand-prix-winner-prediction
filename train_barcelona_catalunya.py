@@ -23,6 +23,22 @@ MODEL_PATH = ROOT / "barcelona_catalunya_model.pkl"
 PREDICTIONS_PATH = ROOT / "barcelona_catalunya_predictions.json"
 METADATA_PATH = ROOT / "barcelona_catalunya_metadata.json"
 GRID_OVERRIDE_PATH = ROOT / "qualifying_grid.json"
+PREDICTION_ONLY_PRIOR_WEIGHTS = {
+    "base_probability": 0.85,
+    "recent_dominance": 0.075,
+    "market_odds": 0.075,
+}
+PREDICTION_ONLY_DRIVER_PRIORS = {
+    "ANT": {
+        "recent_dominance_score": 1.0,
+        "market_decimal_odds": 2.0,
+        "evidence": [
+            "Five consecutive Grand Prix wins before Barcelona-Catalunya",
+            "Monaco 2026 pole, win, fastest lap, led every lap, and Grand Slam",
+            "Quoted Barcelona-Catalunya winner odds: 1/1 (decimal 2.0, American +100)",
+        ],
+    }
+}
 POSTPROCESS_CANDIDATES = []
 for model_weight in (0.45, 0.5, 0.55, 0.6, 0.65, 0.7):
     remaining_weight = 1 - model_weight
@@ -310,6 +326,15 @@ def build_prediction_rows(data: pd.DataFrame, grid_positions: dict[str, int]) ->
                 "BarcelonaExperience": float(history["BarcelonaExperience"]) if history is not None else 0.0,
                 "BarcelonaWinRate": float(history["BarcelonaWinRate"]) if history is not None else 0.0,
                 "IsStreetCircuit": 0,
+                "RecentDominancePriorScore": PREDICTION_ONLY_DRIVER_PRIORS.get(code, {}).get(
+                    "recent_dominance_score", 0.0
+                ),
+                "MarketImpliedProbability": (
+                    1 / PREDICTION_ONLY_DRIVER_PRIORS[code]["market_decimal_odds"]
+                    if code in PREDICTION_ONLY_DRIVER_PRIORS
+                    and PREDICTION_ONLY_DRIVER_PRIORS[code].get("market_decimal_odds")
+                    else 0.0
+                ),
             }
         )
 
@@ -372,6 +397,18 @@ def apply_probability_postprocess(
 ) -> pd.Series:
     priors = calculate_component_priors(pred)
     return blend_probabilities(model_probs, priors, config)
+
+
+def apply_prediction_only_priors(pred: pd.DataFrame, base_probability: pd.Series) -> pd.Series:
+    dominance_prior = normalize_prior(pred["RecentDominancePriorScore"])
+    market_prior = normalize_prior(pred["MarketImpliedProbability"])
+    weights = PREDICTION_ONLY_PRIOR_WEIGHTS
+    adjusted_score = (
+        weights["base_probability"] * base_probability.to_numpy()
+        + weights["recent_dominance"] * dominance_prior.to_numpy()
+        + weights["market_odds"] * market_prior.to_numpy()
+    )
+    return pd.Series(adjusted_score / adjusted_score.sum(), index=base_probability.index)
 
 
 def summarize_backtest(results: list[dict], probability_rows: list[dict]) -> dict:
@@ -558,7 +595,8 @@ def main() -> None:
     model.fit(x, data["Winner"])
     pred = build_prediction_rows(data, grid_positions)
     model_probs = model.predict_proba(pred[FEATURES])[:, 1]
-    pred["probability"] = apply_probability_postprocess(pred, model_probs, selected_config)
+    pred["validated_probability"] = apply_probability_postprocess(pred, model_probs, selected_config)
+    pred["probability"] = apply_prediction_only_priors(pred, pred["validated_probability"])
     backtest = {
         "races": tuned_postprocess["races"],
         "summary": tuned_postprocess["summary"],
@@ -576,7 +614,7 @@ def main() -> None:
     metadata = {
         "race": "Barcelona-Catalunya GP",
         "circuit": "Circuit de Barcelona-Catalunya",
-        "model_version": "barcelona-catalunya-hgb-calibrated-1.2",
+        "model_version": "barcelona-catalunya-hgb-calibrated-1.3",
         "training_samples": int(len(data)),
         "training_races_loaded": int(data[["Year", "GrandPrix"]].drop_duplicates().shape[0]),
         "features": FEATURES,
@@ -590,6 +628,8 @@ def main() -> None:
             "grid_prior_weight": round(selected_config["grid_weight"], 4),
             "barcelona_track_prior_weight": round(selected_config["track_weight"], 4),
             "floor_before_normalization": selected_config["floor"],
+            "prediction_only_prior_weights": PREDICTION_ONLY_PRIOR_WEIGHTS,
+            "prediction_only_driver_priors": PREDICTION_ONLY_DRIVER_PRIORS,
             "selection": {
                 "method": "walk_forward_grid_search",
                 "candidates_tested": tuned_postprocess["candidates_tested"],
