@@ -33,7 +33,7 @@ Prediction-only priors affect the exported 2026 Barcelona-Catalunya prediction, 
 
 ## Current Model
 
-- Version: `barcelona-catalunya-hgb-calibrated-1.3`
+- Version: `barcelona-catalunya-hgb-calibrated-1.4`
 - Training samples: `671`
 - Historical races loaded: `33`
 
@@ -51,6 +51,8 @@ Validation starts after the first 8 loaded races are available as training histo
 | Log loss | 0.1013 |
 | Brier score | 0.0307 |
 
+v1.4 also exports `barcelona_significance` ablation results and Spain vs non-Spain validation slices in metadata. See `model_experiments.md` for accepted and rejected experiments.
+
 Prediction-only winner allocation:
 
 - Contenders: `ANT`, `NOR`, `PIA`, `RUS`, `VER`, `LEC`, `HAM`
@@ -59,13 +61,15 @@ Prediction-only winner allocation:
 
 The contender allocation affects only the exported race prediction. It is not included in walk-forward validation metrics.
 
-Current exported top three:
+Current exported top five (pre-qualifying, with full market odds prior):
 
 | Rank | Driver | Team | Probability |
 | ---: | --- | --- | ---: |
-| 1 | Antonelli | Mercedes | 0.3293 |
-| 2 | Norris | McLaren | 0.2446 |
-| 3 | Piastri | McLaren | 0.1670 |
+| 1 | Antonelli | Mercedes | 0.2825 |
+| 2 | Norris | McLaren | 0.2511 |
+| 3 | Piastri | McLaren | 0.1720 |
+| 4 | Russell | Mercedes | 0.1281 |
+| 5 | Verstappen | Red Bull Racing | 0.0499 |
 
 ## Run
 
