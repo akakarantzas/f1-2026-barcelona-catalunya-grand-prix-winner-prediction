@@ -113,6 +113,8 @@ FEATURES = [
 ]
 CATEGORICAL_FEATURES = ["DriverCode", "TeamName"]
 NUMERIC_FEATURES = [feature for feature in FEATURES if feature not in CATEGORICAL_FEATURES]
+BARCELONA_FEATURES = {"BarcelonaExperience", "BarcelonaWinRate"}
+TRACK_GRAND_PRIX = "Spain"
 
 DRIVER_ROSTER_2026 = [
     ("NOR", "Norris", "McLaren"),
@@ -316,7 +318,15 @@ def engineer_features(data: pd.DataFrame) -> pd.DataFrame:
     return data
 
 
-def build_model() -> Pipeline:
+def resolve_feature_columns(features: list[str] | None = None) -> tuple[list[str], list[str], list[str]]:
+    feature_list = features or FEATURES
+    categorical = [feature for feature in CATEGORICAL_FEATURES if feature in feature_list]
+    numeric = [feature for feature in feature_list if feature not in CATEGORICAL_FEATURES]
+    return feature_list, categorical, numeric
+
+
+def build_model(features: list[str] | None = None) -> Pipeline:
+    _, categorical, numeric = resolve_feature_columns(features)
     base = HistGradientBoostingClassifier(
         learning_rate=0.05,
         max_iter=220,
@@ -338,9 +348,9 @@ def build_model() -> Pipeline:
                                 unknown_value=-1,
                                 encoded_missing_value=-1,
                             ),
-                            CATEGORICAL_FEATURES,
+                            categorical,
                         ),
-                        ("numeric", "passthrough", NUMERIC_FEATURES),
+                        ("numeric", "passthrough", numeric),
                     ],
                     remainder="drop",
                 ),
@@ -464,6 +474,10 @@ def apply_prediction_only_priors(pred: pd.DataFrame, base_probability: pd.Series
     return final_probability / final_probability.sum()
 
 
+def is_spain_race(race_label: str) -> bool:
+    return race_label.endswith(f" {TRACK_GRAND_PRIX}")
+
+
 def summarize_backtest(results: list[dict], probability_rows: list[dict]) -> dict:
     if not results:
         return {
@@ -499,6 +513,146 @@ def rank_backtest_result(item: dict) -> tuple:
     )
 
 
+def summarize_backtest_by_circuit(backtest: dict) -> dict:
+    races = backtest["races"]
+    probability_rows = backtest.get("probability_rows", [])
+    spain_races = [race for race in races if is_spain_race(race["race"])]
+    non_spain_races = [race for race in races if not is_spain_race(race["race"])]
+    spain_labels = {race["race"] for race in spain_races}
+    non_spain_labels = {race["race"] for race in non_spain_races}
+
+    return {
+        "spain": summarize_backtest(
+            spain_races,
+            [row for row in probability_rows if row.get("race") in spain_labels],
+        ),
+        "non_spain": summarize_backtest(
+            non_spain_races,
+            [row for row in probability_rows if row.get("race") in non_spain_labels],
+        ),
+        "all": backtest["summary"],
+    }
+
+
+def delta_backtest_summary(baseline: dict, variant: dict) -> dict:
+    delta = {}
+    for metric in (
+        "top1_accuracy",
+        "top3_accuracy",
+        "top5_accuracy",
+        "mean_winner_rank",
+        "log_loss",
+        "brier_score",
+    ):
+        baseline_value = baseline.get(metric)
+        variant_value = variant.get(metric)
+        if baseline_value is None or variant_value is None:
+            delta[metric] = None
+            continue
+        if metric == "mean_winner_rank":
+            delta[metric] = round(float(baseline_value - variant_value), 4)
+        else:
+            delta[metric] = round(float(variant_value - baseline_value), 4)
+    return delta
+
+
+def evaluate_barcelona_ablations(
+    data: pd.DataFrame,
+    selected_config: dict,
+    min_training_races: int = 8,
+) -> dict:
+    no_barcelona_features = [feature for feature in FEATURES if feature not in BARCELONA_FEATURES]
+    variants = [
+        {
+            "id": "baseline",
+            "label": "Full model",
+            "features": FEATURES,
+            "zero_track_prior": False,
+        },
+        {
+            "id": "no_barcelona_features",
+            "label": "Drop BarcelonaExperience and BarcelonaWinRate",
+            "features": no_barcelona_features,
+            "zero_track_prior": False,
+        },
+        {
+            "id": "no_track_prior",
+            "label": "Zero Barcelona track prior weight",
+            "features": FEATURES,
+            "zero_track_prior": True,
+        },
+        {
+            "id": "no_barcelona_signal",
+            "label": "Drop Barcelona features and track prior",
+            "features": no_barcelona_features,
+            "zero_track_prior": True,
+        },
+    ]
+
+    evaluated = {}
+    for variant in variants:
+        config = dict(selected_config)
+        if variant["zero_track_prior"]:
+            config["track_weight"] = 0.0
+
+        backtest = run_walk_forward_backtest(
+            data,
+            config,
+            features=variant["features"],
+            min_training_races=min_training_races,
+        )
+        evaluated[variant["id"]] = {
+            "label": variant["label"],
+            "summary": backtest["summary"],
+            "by_circuit": summarize_backtest_by_circuit(backtest),
+        }
+
+    baseline = evaluated["baseline"]
+    deltas = {}
+    for variant_id, variant_result in evaluated.items():
+        if variant_id == "baseline":
+            continue
+        deltas[variant_id] = {
+            "summary": delta_backtest_summary(baseline["summary"], variant_result["summary"]),
+            "spain": delta_backtest_summary(
+                baseline["by_circuit"]["spain"],
+                variant_result["by_circuit"]["spain"],
+            ),
+            "non_spain": delta_backtest_summary(
+                baseline["by_circuit"]["non_spain"],
+                variant_result["by_circuit"]["non_spain"],
+            ),
+        }
+
+    spain_delta = deltas["no_barcelona_signal"]["spain"]
+    return {
+        "method": "walk_forward_ablation",
+        "baseline": {
+            "summary": baseline["summary"],
+            "by_circuit": baseline["by_circuit"],
+        },
+        "variants": {
+            variant_id: {
+                "label": variant_result["label"],
+                "summary": variant_result["summary"],
+                "by_circuit": variant_result["by_circuit"],
+                "delta_vs_baseline": deltas.get(variant_id),
+            }
+            for variant_id, variant_result in evaluated.items()
+            if variant_id != "baseline"
+        },
+        "barcelona_significance_score": {
+            "spain_top1_delta": spain_delta.get("top1_accuracy"),
+            "spain_log_loss_delta": spain_delta.get("log_loss"),
+            "spain_mean_winner_rank_delta": spain_delta.get("mean_winner_rank"),
+            "note": (
+                "Positive top1/log_loss/mean_winner_rank deltas mean the full model "
+                "outperforms the no-Barcelona-signal ablation on Spain races."
+            ),
+        },
+    }
+
+
 def tune_walk_forward_postprocess(data: pd.DataFrame, min_training_races: int = 8) -> dict:
     race_keys = (
         data[["RaceOrder", "Year", "GrandPrix"]]
@@ -521,6 +675,7 @@ def tune_walk_forward_postprocess(data: pd.DataFrame, min_training_races: int = 
         if train["Winner"].nunique() < 2 or target.empty:
             continue
 
+        race_label = f"{race['Year']} {race['GrandPrix']}"
         model = build_model()
         model.fit(train[FEATURES], train["Winner"])
         model_probs = model.predict_proba(target[FEATURES])[:, 1]
@@ -542,7 +697,7 @@ def tune_walk_forward_postprocess(data: pd.DataFrame, min_training_races: int = 
             winner = ranked.loc[winner_index[0]]
             candidate["races"].append(
                 {
-                    "race": f"{race['Year']} {race['GrandPrix']}",
+                    "race": race_label,
                     "winner": str(winner["Abbreviation"]),
                     "winner_rank": winner_rank,
                     "winner_probability": round(float(winner["probability"]), 4),
@@ -550,6 +705,7 @@ def tune_walk_forward_postprocess(data: pd.DataFrame, min_training_races: int = 
             )
             candidate["probability_rows"].extend(
                 {
+                    "race": race_label,
                     "actual": int(row["Winner"]),
                     "probability": float(row["probability"]),
                 }
@@ -579,8 +735,10 @@ def tune_walk_forward_postprocess(data: pd.DataFrame, min_training_races: int = 
 def run_walk_forward_backtest(
     data: pd.DataFrame,
     config: dict,
+    features: list[str] | None = None,
     min_training_races: int = 8,
 ) -> dict:
+    feature_columns, _, _ = resolve_feature_columns(features)
     race_keys = (
         data[["RaceOrder", "Year", "GrandPrix"]]
         .drop_duplicates()
@@ -600,9 +758,10 @@ def run_walk_forward_backtest(
         if train["Winner"].nunique() < 2 or target.empty:
             continue
 
-        model = build_model()
-        model.fit(train[FEATURES], train["Winner"])
-        model_probs = model.predict_proba(target[FEATURES])[:, 1]
+        race_label = f"{race['Year']} {race['GrandPrix']}"
+        model = build_model(feature_columns)
+        model.fit(train[feature_columns], train["Winner"])
+        model_probs = model.predict_proba(target[feature_columns])[:, 1]
         target["probability"] = apply_probability_postprocess(
             target,
             model_probs,
@@ -617,7 +776,7 @@ def run_walk_forward_backtest(
         winner = ranked.loc[winner_index[0]]
         results.append(
             {
-                "race": f"{race['Year']} {race['GrandPrix']}",
+                "race": race_label,
                 "winner": str(winner["Abbreviation"]),
                 "winner_rank": winner_rank,
                 "winner_probability": round(float(winner["probability"]), 4),
@@ -625,6 +784,7 @@ def run_walk_forward_backtest(
         )
         probability_rows.extend(
             {
+                "race": race_label,
                 "actual": int(row["Winner"]),
                 "probability": float(row["probability"]),
             }
@@ -633,6 +793,7 @@ def run_walk_forward_backtest(
 
     return {
         "races": results,
+        "probability_rows": probability_rows,
         "summary": summarize_backtest(results, probability_rows),
     }
 
@@ -643,6 +804,7 @@ def main() -> None:
     market_probabilities, market_metadata = load_market_odds()
     tuned_postprocess = tune_walk_forward_postprocess(data)
     selected_config = tuned_postprocess["selected_config"]
+    barcelona_significance = evaluate_barcelona_ablations(data, selected_config)
     model = build_model()
     x = data[FEATURES]
 
@@ -654,6 +816,7 @@ def main() -> None:
     backtest = {
         "races": tuned_postprocess["races"],
         "summary": tuned_postprocess["summary"],
+        "by_circuit": barcelona_significance["baseline"]["by_circuit"],
     }
 
     predictions = [
@@ -668,14 +831,16 @@ def main() -> None:
     metadata = {
         "race": "Barcelona-Catalunya GP",
         "circuit": "Circuit de Barcelona-Catalunya",
-        "model_version": "barcelona-catalunya-hgb-calibrated-1.3",
+        "model_version": "barcelona-catalunya-hgb-calibrated-1.4",
         "training_samples": int(len(data)),
         "training_races_loaded": int(data[["Year", "GrandPrix"]].drop_duplicates().shape[0]),
         "features": FEATURES,
         "validation": {
             "method": "walk_forward_backtest",
             **backtest["summary"],
+            "by_circuit": backtest["by_circuit"],
         },
+        "barcelona_significance": barcelona_significance,
         "prediction_postprocess": {
             "model_weight": round(selected_config["model_weight"], 4),
             "form_prior_weight": round(selected_config["form_weight"], 4),
