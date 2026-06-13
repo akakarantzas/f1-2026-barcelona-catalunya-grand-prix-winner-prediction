@@ -23,11 +23,24 @@ MODEL_PATH = ROOT / "barcelona_catalunya_model.pkl"
 PREDICTIONS_PATH = ROOT / "barcelona_catalunya_predictions.json"
 METADATA_PATH = ROOT / "barcelona_catalunya_metadata.json"
 GRID_OVERRIDE_PATH = ROOT / "qualifying_grid.json"
-POSTPROCESS_CANDIDATES = [
-    {"model_weight": model_weight, "floor": floor}
-    for model_weight in (0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85)
-    for floor in (0.0005, 0.001, 0.002)
-]
+POSTPROCESS_CANDIDATES = []
+for model_weight in (0.45, 0.5, 0.55, 0.6, 0.65, 0.7):
+    remaining_weight = 1 - model_weight
+    for grid_share in (0.25, 0.35, 0.45, 0.55):
+        for track_share in (0.15, 0.25, 0.35):
+            form_share = 1 - grid_share - track_share
+            if form_share <= 0:
+                continue
+            for floor in (0.0005, 0.001):
+                POSTPROCESS_CANDIDATES.append(
+                    {
+                        "model_weight": model_weight,
+                        "form_weight": remaining_weight * form_share,
+                        "grid_weight": remaining_weight * grid_share,
+                        "track_weight": remaining_weight * track_share,
+                        "floor": floor,
+                    }
+                )
 
 RACES_TO_LOAD = [
     (2022, "Spain"),
@@ -166,6 +179,7 @@ def load_grid_positions() -> tuple[dict[str, int], dict]:
 
 
 def load_results() -> pd.DataFrame:
+    CACHE_DIR.mkdir(exist_ok=True)
     fastf1.Cache.enable_cache(str(CACHE_DIR))
     rows = []
 
@@ -302,41 +316,62 @@ def build_prediction_rows(data: pd.DataFrame, grid_positions: dict[str, int]) ->
     return pd.DataFrame(rows)
 
 
-def calculate_form_prior(pred: pd.DataFrame) -> pd.Series:
+def normalize_prior(score: pd.Series) -> pd.Series:
+    score = score.replace([np.inf, -np.inf], np.nan).fillna(0).clip(lower=0)
+    total = score.sum()
+    if total <= 0:
+        return pd.Series(np.full(len(score), 1 / len(score)), index=score.index)
+    return score / total
+
+
+def calculate_component_priors(pred: pd.DataFrame) -> dict[str, pd.Series]:
     avg_points_max = pred["AvgPoints5"].clip(lower=0).max()
     team_points_max = pred["TeamAvgPoints5"].clip(lower=0).max()
+    avg_finish_score = 1 / pred["AvgFinish5"].clip(lower=1)
+    avg_finish_max = avg_finish_score.max()
+    experience_max = pred["BarcelonaExperience"].clip(lower=0).max()
+
     form_score = (
-        (1 / pred["GridPosition"].clip(lower=1))
-        + pred["AvgPoints5"].clip(lower=0) / (avg_points_max if avg_points_max else 1)
+        pred["AvgPoints5"].clip(lower=0) / (avg_points_max if avg_points_max else 1)
         + pred["TeamAvgPoints5"].clip(lower=0) / (team_points_max if team_points_max else 1)
         + pred["WinRate10"].clip(lower=0)
-        + pred["BarcelonaWinRate"].clip(lower=0)
+        + avg_finish_score / (avg_finish_max if avg_finish_max else 1)
     )
-    return form_score / form_score.sum()
+    grid_score = 1 / np.power(pred["GridPosition"].clip(lower=1), 1.25)
+    track_score = (
+        pred["BarcelonaWinRate"].clip(lower=0)
+        + 0.15 * pred["BarcelonaExperience"].clip(lower=0) / (experience_max if experience_max else 1)
+    )
+
+    return {
+        "form": normalize_prior(form_score),
+        "grid": normalize_prior(grid_score),
+        "track": normalize_prior(track_score),
+    }
 
 
 def blend_probabilities(
     model_probs: np.ndarray,
-    form_prior: pd.Series,
-    model_weight: float,
-    floor: float,
+    priors: dict[str, pd.Series],
+    config: dict,
 ) -> pd.Series:
     blended_score = (
-        (model_weight * model_probs)
-        + ((1 - model_weight) * form_prior.to_numpy())
-        + floor
+        (config["model_weight"] * model_probs)
+        + (config["form_weight"] * priors["form"].to_numpy())
+        + (config["grid_weight"] * priors["grid"].to_numpy())
+        + (config["track_weight"] * priors["track"].to_numpy())
+        + config["floor"]
     )
-    return pd.Series(blended_score / blended_score.sum(), index=form_prior.index)
+    return pd.Series(blended_score / blended_score.sum(), index=priors["form"].index)
 
 
 def apply_probability_postprocess(
     pred: pd.DataFrame,
     model_probs: np.ndarray,
-    model_weight: float,
-    floor: float,
+    config: dict,
 ) -> pd.Series:
-    form_prior = calculate_form_prior(pred)
-    return blend_probabilities(model_probs, form_prior, model_weight, floor)
+    priors = calculate_component_priors(pred)
+    return blend_probabilities(model_probs, priors, config)
 
 
 def summarize_backtest(results: list[dict], probability_rows: list[dict]) -> dict:
@@ -399,15 +434,14 @@ def tune_walk_forward_postprocess(data: pd.DataFrame, min_training_races: int = 
         model = build_model()
         model.fit(train[FEATURES], train["Winner"])
         model_probs = model.predict_proba(target[FEATURES])[:, 1]
-        form_prior = calculate_form_prior(target)
+        priors = calculate_component_priors(target)
 
         for candidate in candidates.values():
             config = candidate["config"]
             target["probability"] = blend_probabilities(
                 model_probs,
-                form_prior,
-                config["model_weight"],
-                config["floor"],
+                priors,
+                config,
             )
             ranked = target.sort_values("probability", ascending=False).reset_index(drop=True)
             winner_index = ranked.index[ranked["Winner"].eq(1)]
@@ -454,8 +488,7 @@ def tune_walk_forward_postprocess(data: pd.DataFrame, min_training_races: int = 
 
 def run_walk_forward_backtest(
     data: pd.DataFrame,
-    model_weight: float,
-    floor: float,
+    config: dict,
     min_training_races: int = 8,
 ) -> dict:
     race_keys = (
@@ -483,8 +516,7 @@ def run_walk_forward_backtest(
         target["probability"] = apply_probability_postprocess(
             target,
             model_probs,
-            model_weight,
-            floor,
+            config,
         )
         ranked = target.sort_values("probability", ascending=False).reset_index(drop=True)
         winner_index = ranked.index[ranked["Winner"].eq(1)]
@@ -519,15 +551,14 @@ def main() -> None:
     data = engineer_features(load_results())
     grid_positions, grid_metadata = load_grid_positions()
     tuned_postprocess = tune_walk_forward_postprocess(data)
-    model_weight = tuned_postprocess["selected_config"]["model_weight"]
-    floor = tuned_postprocess["selected_config"]["floor"]
+    selected_config = tuned_postprocess["selected_config"]
     model = build_model()
     x = data[FEATURES]
 
     model.fit(x, data["Winner"])
     pred = build_prediction_rows(data, grid_positions)
     model_probs = model.predict_proba(pred[FEATURES])[:, 1]
-    pred["probability"] = apply_probability_postprocess(pred, model_probs, model_weight, floor)
+    pred["probability"] = apply_probability_postprocess(pred, model_probs, selected_config)
     backtest = {
         "races": tuned_postprocess["races"],
         "summary": tuned_postprocess["summary"],
@@ -545,7 +576,7 @@ def main() -> None:
     metadata = {
         "race": "Barcelona-Catalunya GP",
         "circuit": "Circuit de Barcelona-Catalunya",
-        "model_version": "barcelona-catalunya-hgb-calibrated-1.1",
+        "model_version": "barcelona-catalunya-hgb-calibrated-1.2",
         "training_samples": int(len(data)),
         "training_races_loaded": int(data[["Year", "GrandPrix"]].drop_duplicates().shape[0]),
         "features": FEATURES,
@@ -554,9 +585,11 @@ def main() -> None:
             **backtest["summary"],
         },
         "prediction_postprocess": {
-            "model_weight": model_weight,
-            "form_prior_weight": round(1 - model_weight, 4),
-            "floor_before_normalization": floor,
+            "model_weight": round(selected_config["model_weight"], 4),
+            "form_prior_weight": round(selected_config["form_weight"], 4),
+            "grid_prior_weight": round(selected_config["grid_weight"], 4),
+            "barcelona_track_prior_weight": round(selected_config["track_weight"], 4),
+            "floor_before_normalization": selected_config["floor"],
             "selection": {
                 "method": "walk_forward_grid_search",
                 "candidates_tested": tuned_postprocess["candidates_tested"],
