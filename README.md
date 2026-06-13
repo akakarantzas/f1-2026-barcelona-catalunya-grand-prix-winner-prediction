@@ -26,6 +26,7 @@ This repository owns data loading, feature engineering, validation, training, an
 - Applies current-race prediction-only priors after validation:
   - recent dominance
   - optional market odds
+  - winner-contender allocation
 - Exports ranked win probabilities and metadata for the app.
 
 Prediction-only priors affect the exported 2026 Barcelona-Catalunya prediction, but they are not counted as historical validation improvements.
@@ -50,13 +51,21 @@ Validation starts after the first 8 loaded races are available as training histo
 | Log loss | 0.1013 |
 | Brier score | 0.0307 |
 
+Prediction-only winner allocation:
+
+- Contenders: `ANT`, `NOR`, `PIA`, `RUS`, `VER`, `LEC`, `HAM`
+- Contender probability mass: `0.93`
+- Rest-of-grid tail probability mass: `0.07`
+
+The contender allocation affects only the exported race prediction. It is not included in walk-forward validation metrics.
+
 Current exported top three:
 
 | Rank | Driver | Team | Probability |
 | ---: | --- | --- | ---: |
-| 1 | Antonelli | Mercedes | 0.3181 |
-| 2 | Norris | McLaren | 0.2364 |
-| 3 | Piastri | McLaren | 0.1614 |
+| 1 | Antonelli | Mercedes | 0.3293 |
+| 2 | Norris | McLaren | 0.2446 |
+| 3 | Piastri | McLaren | 0.1670 |
 
 ## Run
 
