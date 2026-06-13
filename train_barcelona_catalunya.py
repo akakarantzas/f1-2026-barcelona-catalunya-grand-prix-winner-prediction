@@ -23,6 +23,7 @@ MODEL_PATH = ROOT / "barcelona_catalunya_model.pkl"
 PREDICTIONS_PATH = ROOT / "barcelona_catalunya_predictions.json"
 METADATA_PATH = ROOT / "barcelona_catalunya_metadata.json"
 GRID_OVERRIDE_PATH = ROOT / "qualifying_grid.json"
+MARKET_ODDS_PATH = ROOT / "market_odds.json"
 PREDICTION_ONLY_PRIOR_WEIGHTS = {
     "base_probability": 0.85,
     "recent_dominance": 0.075,
@@ -31,11 +32,9 @@ PREDICTION_ONLY_PRIOR_WEIGHTS = {
 PREDICTION_ONLY_DRIVER_PRIORS = {
     "ANT": {
         "recent_dominance_score": 1.0,
-        "market_decimal_odds": 2.0,
         "evidence": [
             "Five consecutive Grand Prix wins before Barcelona-Catalunya",
             "Monaco 2026 pole, win, fastest lap, led every lap, and Grand Slam",
-            "Quoted Barcelona-Catalunya winner odds: 1/1 (decimal 2.0, American +100)",
         ],
     }
 }
@@ -194,6 +193,50 @@ def load_grid_positions() -> tuple[dict[str, int], dict]:
     }
 
 
+def load_market_odds() -> tuple[dict[str, float], dict]:
+    if not MARKET_ODDS_PATH.exists():
+        return {}, {
+            "market_source": None,
+            "market_odds_file": None,
+            "drivers": [],
+            "book_overround": None,
+        }
+
+    raw = json.loads(MARKET_ODDS_PATH.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("market_odds.json must be an object")
+
+    raw_odds = raw.get("odds", raw)
+    if not isinstance(raw_odds, dict) or not raw_odds:
+        raise ValueError("market_odds.json must include non-empty odds")
+
+    valid_codes = {code for code, _, _ in DRIVER_ROSTER_2026}
+    implied = {}
+    for code, value in raw_odds.items():
+        if code not in valid_codes:
+            raise ValueError(f"market_odds.json contains unknown driver code: {code}")
+
+        decimal_odds = value.get("decimal") if isinstance(value, dict) else value
+        decimal_odds = float(decimal_odds)
+        if decimal_odds <= 1:
+            raise ValueError(f"Decimal odds for {code} must be greater than 1")
+        implied[code] = 1 / decimal_odds
+
+    overround = sum(implied.values())
+    fair_probabilities = {
+        code: probability / overround
+        for code, probability in implied.items()
+    }
+
+    return fair_probabilities, {
+        "market_source": raw.get("source") if isinstance(raw.get("source"), str) else None,
+        "market_as_of": raw.get("as_of") if isinstance(raw.get("as_of"), str) else None,
+        "market_odds_file": MARKET_ODDS_PATH.name,
+        "drivers": sorted(fair_probabilities),
+        "book_overround": round(overround, 4),
+    }
+
+
 def load_results() -> pd.DataFrame:
     CACHE_DIR.mkdir(exist_ok=True)
     fastf1.Cache.enable_cache(str(CACHE_DIR))
@@ -305,7 +348,11 @@ def build_model() -> Pipeline:
     )
 
 
-def build_prediction_rows(data: pd.DataFrame, grid_positions: dict[str, int]) -> pd.DataFrame:
+def build_prediction_rows(
+    data: pd.DataFrame,
+    grid_positions: dict[str, int],
+    market_probabilities: dict[str, float],
+) -> pd.DataFrame:
     latest = data.sort_values("RaceOrder").groupby("Abbreviation").tail(1).set_index("Abbreviation")
     rows = []
 
@@ -329,12 +376,7 @@ def build_prediction_rows(data: pd.DataFrame, grid_positions: dict[str, int]) ->
                 "RecentDominancePriorScore": PREDICTION_ONLY_DRIVER_PRIORS.get(code, {}).get(
                     "recent_dominance_score", 0.0
                 ),
-                "MarketImpliedProbability": (
-                    1 / PREDICTION_ONLY_DRIVER_PRIORS[code]["market_decimal_odds"]
-                    if code in PREDICTION_ONLY_DRIVER_PRIORS
-                    and PREDICTION_ONLY_DRIVER_PRIORS[code].get("market_decimal_odds")
-                    else 0.0
-                ),
+                "MarketFairProbability": market_probabilities.get(code, 0.0),
             }
         )
 
@@ -401,7 +443,7 @@ def apply_probability_postprocess(
 
 def apply_prediction_only_priors(pred: pd.DataFrame, base_probability: pd.Series) -> pd.Series:
     dominance_prior = normalize_prior(pred["RecentDominancePriorScore"])
-    market_prior = normalize_prior(pred["MarketImpliedProbability"])
+    market_prior = normalize_prior(pred["MarketFairProbability"])
     weights = PREDICTION_ONLY_PRIOR_WEIGHTS
     adjusted_score = (
         weights["base_probability"] * base_probability.to_numpy()
@@ -587,13 +629,14 @@ def run_walk_forward_backtest(
 def main() -> None:
     data = engineer_features(load_results())
     grid_positions, grid_metadata = load_grid_positions()
+    market_probabilities, market_metadata = load_market_odds()
     tuned_postprocess = tune_walk_forward_postprocess(data)
     selected_config = tuned_postprocess["selected_config"]
     model = build_model()
     x = data[FEATURES]
 
     model.fit(x, data["Winner"])
-    pred = build_prediction_rows(data, grid_positions)
+    pred = build_prediction_rows(data, grid_positions, market_probabilities)
     model_probs = model.predict_proba(pred[FEATURES])[:, 1]
     pred["validated_probability"] = apply_probability_postprocess(pred, model_probs, selected_config)
     pred["probability"] = apply_prediction_only_priors(pred, pred["validated_probability"])
@@ -630,6 +673,7 @@ def main() -> None:
             "floor_before_normalization": selected_config["floor"],
             "prediction_only_prior_weights": PREDICTION_ONLY_PRIOR_WEIGHTS,
             "prediction_only_driver_priors": PREDICTION_ONLY_DRIVER_PRIORS,
+            "market_odds": market_metadata,
             "selection": {
                 "method": "walk_forward_grid_search",
                 "candidates_tested": tuned_postprocess["candidates_tested"],
