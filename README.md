@@ -2,7 +2,7 @@
 
 Standalone ML project for predicting the 2026 Barcelona-Catalunya Grand Prix winner.
 
-The production app should not train this model at request time. This repository owns the data loading, feature engineering, training, validation, model artifact, and prediction export. The app can consume the exported `barcelona_catalunya_predictions.json` and, if needed later, the frozen `barcelona_catalunya_model.pkl`.
+This repository owns data loading, feature engineering, validation, training, and prediction export. The production app consumes exported artifacts; it does not train the model at request time.
 
 ## Tech Stack
 
@@ -17,10 +17,18 @@ The production app should not train this model at request time. This repository 
 
 - Loads historical Barcelona/Spanish GP results plus recent full-season form using FastF1.
 - Builds rolling driver and team performance features.
-- Trains a calibrated gradient boosting classifier with cross-validation.
-- Tunes post-processing with walk-forward backtesting.
-- Blends validated model probabilities with form, grid, Barcelona-track, recent-dominance, and optional market-odds priors.
-- Exports ranked win-probability JSON and metadata for the 2026 Barcelona-Catalunya GP.
+- Trains a calibrated `HistGradientBoostingClassifier`.
+- Uses walk-forward backtesting to tune the validated probability blend:
+  - model probability
+  - recent form prior
+  - grid-position prior
+  - Barcelona-track prior
+- Applies current-race prediction-only priors after validation:
+  - recent dominance
+  - optional market odds
+- Exports ranked win probabilities and metadata for the app.
+
+Prediction-only priors affect the exported 2026 Barcelona-Catalunya prediction, but they are not counted as historical validation improvements.
 
 ## Current Model
 
@@ -40,6 +48,14 @@ Walk-forward validation:
 | Log loss | 0.1013 |
 | Brier score | 0.0307 |
 
+Current exported top three:
+
+| Rank | Driver | Team | Probability |
+| ---: | --- | --- | ---: |
+| 1 | Antonelli | Mercedes | 0.3181 |
+| 2 | Norris | McLaren | 0.2364 |
+| 3 | Piastri | McLaren | 0.1614 |
+
 ## Run
 
 ```bash
@@ -51,10 +67,10 @@ The script writes the exported artifacts in the repository root.
 
 ## Prediction Inputs
 
-The exporter can run with only the defaults in `train_barcelona_catalunya.py`, but it also supports optional JSON inputs:
+The exporter can run from defaults in `train_barcelona_catalunya.py`. Optional JSON files override or extend prediction inputs:
 
-- `qualifying_grid.json`: actual or overridden grid positions after qualifying.
-- `market_odds.json`: pre-race market odds used as a small prediction-only prior.
+- `qualifying_grid.json`: actual grid positions after qualifying.
+- `market_odds.json`: pre-race market odds used as a prediction-only prior.
 
 Example files:
 
@@ -78,11 +94,13 @@ fair_probability = implied_probability / sum(all_implied_probabilities)
 
 The market prior is prediction-only. It does not change the walk-forward validation metrics because those metrics remain based on historical races.
 
+For cleaner probabilities, include odds for all realistic contenders, not only one driver. A single-driver odds file assigns the full market prior to that driver after normalization.
+
 ## Outputs
 
 - `barcelona_catalunya_predictions.json`
-- `barcelona_catalunya_model.pkl`
 - `barcelona_catalunya_metadata.json`
+- `barcelona_catalunya_model.pkl`
 
 ## Production Integration
 
