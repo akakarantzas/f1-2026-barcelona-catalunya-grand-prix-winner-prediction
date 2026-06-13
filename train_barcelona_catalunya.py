@@ -29,6 +29,8 @@ PREDICTION_ONLY_PRIOR_WEIGHTS = {
     "recent_dominance": 0.075,
     "market_odds": 0.075,
 }
+WIN_CONTENDERS = {"ANT", "NOR", "PIA", "RUS", "VER", "LEC", "HAM"}
+CONTENDER_PROBABILITY_MASS = 0.93
 PREDICTION_ONLY_DRIVER_PRIORS = {
     "ANT": {
         "recent_dominance_score": 1.0,
@@ -450,7 +452,16 @@ def apply_prediction_only_priors(pred: pd.DataFrame, base_probability: pd.Series
         + weights["recent_dominance"] * dominance_prior.to_numpy()
         + weights["market_odds"] * market_prior.to_numpy()
     )
-    return pd.Series(adjusted_score / adjusted_score.sum(), index=base_probability.index)
+    adjusted_probability = pd.Series(adjusted_score / adjusted_score.sum(), index=base_probability.index)
+    contender_mask = pred["Abbreviation"].isin(WIN_CONTENDERS)
+    contender_probability = normalize_prior(adjusted_probability.where(contender_mask, 0))
+    tail_probability = normalize_prior(adjusted_probability.where(~contender_mask, 0))
+
+    final_probability = (
+        CONTENDER_PROBABILITY_MASS * contender_probability
+        + (1 - CONTENDER_PROBABILITY_MASS) * tail_probability
+    )
+    return final_probability / final_probability.sum()
 
 
 def summarize_backtest(results: list[dict], probability_rows: list[dict]) -> dict:
@@ -672,6 +683,8 @@ def main() -> None:
             "barcelona_track_prior_weight": round(selected_config["track_weight"], 4),
             "floor_before_normalization": selected_config["floor"],
             "prediction_only_prior_weights": PREDICTION_ONLY_PRIOR_WEIGHTS,
+            "contender_probability_mass": CONTENDER_PROBABILITY_MASS,
+            "win_contenders": sorted(WIN_CONTENDERS),
             "prediction_only_driver_priors": PREDICTION_ONLY_DRIVER_PRIORS,
             "market_odds": market_metadata,
             "selection": {
