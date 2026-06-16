@@ -1,8 +1,12 @@
 # F1 2026 Barcelona-Catalunya Grand Prix Winner Prediction
 
-Standalone ML project for predicting the 2026 Barcelona-Catalunya Grand Prix winner.
+Race-specific ML training and artifact-export pipeline for ChicaneAI, my full-stack F1 prediction and driver comparison platform.
 
-This repository owns data loading, feature engineering, validation, training, and prediction export. The production app consumes exported artifacts; it does not train the model at request time.
+Main project: [ChicaneAI](https://github.com/akakarantzas/chicane-ai)
+
+This repository predicts the 2026 Barcelona-Catalunya Grand Prix winner using FastF1 race data, rolling driver/team form features, calibrated gradient boosting, and validation-driven probability blending.
+
+It owns data loading, feature engineering, walk-forward validation, model training, prediction export, and metadata generation. The production ChicaneAI app consumes the exported artifacts; it does not train the model at request time.
 
 ## Tech Stack
 
@@ -61,7 +65,7 @@ Prediction-only winner allocation:
 
 The contender allocation affects only the exported race prediction. It is not included in walk-forward validation metrics.
 
-Current exported top five (pre-qualifying, with full market odds prior):
+Current exported prediction snapshot (pre-qualifying, with full market odds prior):
 
 | Rank | Driver | Team | Probability |
 | ---: | --- | --- | ---: |
@@ -70,6 +74,10 @@ Current exported top five (pre-qualifying, with full market odds prior):
 | 3 | Piastri | McLaren | 0.1720 |
 | 4 | Russell | Mercedes | 0.1281 |
 | 5 | Verstappen | Red Bull Racing | 0.0499 |
+
+### Result note
+
+The model ranked **Kimi Antonelli (Mercedes)** as the top predicted winner with a **28.25% win probability**, but the race outcome was affected by an unpredictable mechanical stoppage. Technical reliability events, safety cars, crashes, and other race-day disruptions are not currently modeled, so the prediction should be interpreted as a competitive-likelihood estimate rather than a deterministic race forecast.
 
 ## Run
 
@@ -107,9 +115,7 @@ implied_probability = 1 / decimal_odds
 fair_probability = implied_probability / sum(all_implied_probabilities)
 ```
 
-The market prior is prediction-only. It does not change the walk-forward validation metrics because those metrics remain based on historical races.
-
-For cleaner probabilities, include odds for all realistic contenders, not only one driver. A single-driver odds file assigns the full market prior to that driver after normalization.
+Prediction-only priors affect only the exported 2026 Barcelona-Catalunya prediction; they are not counted as walk-forward validation improvements.
 
 ## Outputs
 
@@ -117,9 +123,9 @@ For cleaner probabilities, include odds for all realistic contenders, not only o
 - `barcelona_catalunya_metadata.json`
 - `barcelona_catalunya_model.pkl`
 
-## Production Integration
+## ChicaneAI Integration
 
-`chicane-ai` consumes the exported prediction artifacts:
+The main ChicaneAI app consumes the exported prediction artifacts:
 
 - `barcelona_catalunya_predictions.json`
 - `barcelona_catalunya_metadata.json`
